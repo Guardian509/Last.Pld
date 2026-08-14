@@ -5,5 +5,11 @@
 *.cmd  text eol=crlf
 *.ps1  text eol=crlf
 *.cs   text
-*.py   text
 *.md   text
+
+# LF, always. These run on Linux, and a CRLF shebang line makes the kernel
+# report "bad interpreter" -- which also bites when the Windows working copy
+# is executed from WSL over /mnt/c.
+*.py   text eol=lf
+*.sh   text eol=lf
+linux/** text eol=lf
