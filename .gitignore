@@ -1,0 +1,24 @@
+# --- personal data: never commit -------------------------------------------
+# The whole point of the app is that your listening history stays local.
+lastpld.csv
+lastpld.trash.csv
+nowplaying.csv
+startup.log
+
+# Spotify credentials. The refresh token inside is DPAPI-encrypted to your
+# Windows account, but it is still yours and has no business in a repo.
+playlists.txt
+
+# Written with defaults on first run, then edited per machine.
+sources.txt
+
+# --- build output -----------------------------------------------------------
+*.exe
+*.pdb
+
+# --- build scratch ----------------------------------------------------------
+# Build output and the Python venv. Sources live in diagnostics/ and tests/.
+_build/
+
+# --- audio scratch ----------------------------------------------------------
+*.wav
