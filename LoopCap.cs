@@ -105,7 +105,10 @@ static class LoopCap
         }
     }
 
-    static void Capture(int seconds, string outPath)
+    // Public because Last.Pld.cs compiles this file in and calls it directly,
+    // rather than shipping a second exe beside itself. The standalone Main
+    // above still works: build.cmd picks the entry point with /main:.
+    public static void Capture(int seconds, string outPath)
     {
         var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumerator());
 

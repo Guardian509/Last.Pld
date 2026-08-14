@@ -44,8 +44,10 @@ Or build it yourself — the build needs no SDK, no Visual Studio, and no NuGet:
     cd Last.Pld
     build.cmd
 
-That produces `Last.Pld.exe` and `loopcap.exe`. Run the first one; `loopcap.exe`
-is only needed for the optional Identify feature.
+That produces `Last.Pld.exe` — self-contained, including the audio capture used
+by Identify — and `loopcap.exe`, which is only a standalone tester for that
+capture path (`loopcap.exe 12 test.wav`, then play the result). The app does
+not need it at runtime.
 
 ### Optional: enable Identify
 
@@ -74,7 +76,7 @@ behind a clear message if it isn't there.
 | `lastpld.trash.csv` | Deleted rows, with an extra leading `deleted` timestamp. |
 | `sources.txt` | Which apps to log. Edit and restart to apply. |
 | `startup.log` | One line per launch, so "did it start at logon?" is answerable. |
-| `loopcap.exe` / `LoopCap.cs` | WASAPI loopback capture, for Identify. |
+| `LoopCap.cs` | WASAPI loopback capture, for Identify. Compiled into `Last.Pld.exe`; also builds standalone as `loopcap.exe` for testing capture on its own. |
 | `recognize.py` | Fingerprints a clip via Shazam. Needs `_build\venv312`. |
 | `playlists.txt` | Playlist settings. Created on first connect; secrets DPAPI-encrypted. |
 | `tests/` | Test suite. Run it with `test.cmd`. |

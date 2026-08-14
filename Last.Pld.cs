@@ -949,11 +949,9 @@ namespace LastPld
             string raw = Path.Combine(Path.GetTempPath(), "lastpld_capture.wav");
             string clip = Path.Combine(Path.GetTempPath(), "lastpld_clip.wav");
 
-            string loopcap = Path.Combine(dir, "loopcap.exe");
             string python = Path.Combine(dir, @"_build\venv312\Scripts\python.exe");
             string script = Path.Combine(dir, "recognize.py");
 
-            if (!File.Exists(loopcap)) return Fail("loopcap.exe missing");
             if (!File.Exists(python)) return Fail("recognizer not installed");
             if (!File.Exists(script)) return Fail("recognize.py missing");
 
@@ -964,7 +962,8 @@ namespace LastPld
             try { File.Delete(clip); } catch { }
 
             string err;
-            RunProc(loopcap, "12 \"" + raw + "\"", 40000, out err);
+            string captureError = CaptureAudio(12, raw);
+            if (captureError != null) return Fail(captureError);
 
             // WASAPI loopback yields no packets at all while the endpoint is
             // idle, so an empty file means silence, not a broken capture.
@@ -984,6 +983,25 @@ namespace LastPld
             if (json.Length == 0)
                 return Fail(err.Length > 0 ? LastLine(err) : "the recognizer returned nothing");
             return json;
+        }
+
+        // LoopCap is compiled into this exe rather than shipped beside it, so
+        // "download one file" stays true. WASAPI wants an MTA thread and the UI
+        // thread is STA - that is why the standalone loopcap.exe marked its
+        // Main [MTAThread] - so the capture gets a thread of its own.
+        static string CaptureAudio(int seconds, string path)
+        {
+            string error = null;
+            var thread = new Thread(delegate()
+            {
+                try { LoopCap.Capture(seconds, path); }
+                catch (Exception ex) { error = ex.Message; }
+            });
+            thread.SetApartmentState(ApartmentState.MTA);
+            thread.IsBackground = true;
+            thread.Start();
+            if (!thread.Join(40000)) return "audio capture timed out";
+            return error;
         }
 
         static string Fail(string message)
