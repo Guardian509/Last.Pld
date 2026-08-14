@@ -25,7 +25,7 @@ venv, nothing to install before the first run.
 | | |
 |---|---|
 | **Core logging** | Windows 10/11. Nothing else — it builds against the C# compiler and .NET Framework 4.x that ship with Windows. |
-| **Identify** (optional) | [ffmpeg](https://ffmpeg.org) on `PATH`, and **Python 3.12** (see below). |
+| **Identify** (optional) | **Python 3.12** (see below). Audio capture and resampling are built into the exe. |
 | **Playlists** (optional) | A free Spotify developer app. |
 
 ## Install
@@ -52,7 +52,8 @@ not need it at runtime.
 ### Optional: enable Identify
 
 Identify fingerprints system audio against Shazam, for sources that publish no
-metadata at all. It needs ffmpeg on `PATH` and a Python 3.12 environment:
+metadata at all. Capture and the 16 kHz mono conversion happen inside the exe;
+only the recogniser is external, and it needs a Python 3.12 environment:
 
     py -3.12 -m venv _build\venv312
     _build\venv312\Scripts\pip install -r requirements.txt
@@ -92,13 +93,16 @@ rather than starting a second copy.
 
 ### Start it at logon
 
-Scheduled Tasks is more reliable than a Startup-folder shortcut here:
+Already done — the first run registers it under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, which needs no elevation
+and affects only your account. Later runs correct the stored path, so moving the
+exe and running it once is enough to keep it pointing at the right place.
 
-    schtasks /create /tn "Last.Pld" /sc onlogon ^
-      /tr "\"C:\Users\<you>\NowPlaying\Last.Pld.exe\" /background" /rl limited
+    Last.Pld.exe /uninstall   stop starting at logon
 
-A `LastTaskResult` of `267009` means SCHED_S_TASK_RUNNING — the task is healthy
-and still running, not an error.
+**Start at login** in the tray menu toggles the same thing. Deleting the exe
+stops it too, since Windows skips a Run entry whose target is missing; that
+leaves one inert registry value, which `/uninstall` clears.
 
 ## The window
 
@@ -140,7 +144,7 @@ appended to the history tagged `App = Shazam`.
 
 Only a fingerprint is uploaded, never the recording.
 
-Requires `ffmpeg` on PATH and the Python environment in `_build\venv312`. That
+Requires the Python environment in `_build\venv312`. That
 venv **must be Python 3.12** — `shazamio-core`'s 3.14 wheel segfaults at import.
 
 Reel audio is often sped up or pitch-shifted, which defeats fingerprint matching

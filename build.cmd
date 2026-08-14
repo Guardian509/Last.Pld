@@ -23,7 +23,7 @@ rem /main: to say which entry point this build wants.
  /reference:System.Windows.Forms.dll^
  /reference:System.Drawing.dll^
  /reference:System.Security.dll^
- Last.Pld.cs Playlists.cs LoopCap.cs
+ Last.Pld.cs Playlists.cs LoopCap.cs Audio.cs
 if errorlevel 1 (echo BUILD FAILED & exit /b 1)
 
 rem Still built standalone so the capture path can be tested on its own -

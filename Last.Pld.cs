@@ -970,14 +970,20 @@ namespace LastPld
             if (!File.Exists(raw) || new FileInfo(raw).Length < 1024)
                 return Fail("nothing was playing - no audio was captured");
 
-            // 16 kHz mono is what fingerprinters expect
+            // 16 kHz mono is what fingerprinters expect. Done in-process now:
+            // this used to shell out to ffmpeg, which made an optional feature
+            // depend on a separate install the rest of the app never needed.
             try
             {
-                RunProc("ffmpeg", "-hide_banner -loglevel error -y -i \"" + raw +
-                                  "\" -ac 1 -ar 16000 -sample_fmt s16 \"" + clip + "\"", 40000, out err);
+                Wav.Clip captured = Wav.ReadMono(raw);
+                short[] pcm = Resampler.To16kMono(captured.Samples, captured.SampleRate);
+                if (pcm.Length < 16000) return Fail("captured audio was too short");
+                Wav.WritePcm16(clip, pcm, 16000);
             }
-            catch { return Fail("ffmpeg is not installed or not on PATH"); }
-            if (!File.Exists(clip)) return Fail(err.Length > 0 ? LastLine(err) : "ffmpeg failed");
+            catch (Exception ex)
+            {
+                return Fail("could not prepare audio: " + ex.Message);
+            }
 
             string json = RunProc(python, "\"" + script + "\" \"" + clip + "\"", 60000, out err);
             if (json.Length == 0)
