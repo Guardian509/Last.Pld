@@ -10,9 +10,15 @@ History panel (which is only four entries deep and drops radio tracks entirely).
 
 Single executable, no installer, no runtime to ship. It lives in the tray.
 
-**Linux users:** see [`linux/`](linux/) — a standard-library-only Python port
-built on MPRIS, writing the same CSV format. No pip, no venv, nothing to
-install before the first run.
+**One file, one double-click.** Run it once: it starts recording, sits in the
+tray, and sets itself to start every time you log in. It keeps recording for as
+long as the machine is on and you are logged in. To remove it, delete the exe —
+there is nothing else to uninstall. (`Last.Pld.exe /uninstall` also clears the
+logon entry, and **Start at login** in the tray menu toggles it.)
+
+**Linux users:** see [`linux/`](linux/) — the same idea in one Python file,
+built on MPRIS, writing the same CSV format. Standard library only: no pip, no
+venv, nothing to install before the first run.
 
 ## Requirements
 
@@ -24,14 +30,22 @@ install before the first run.
 
 ## Install
 
-Either grab a build from Releases, or build it yourself — the build needs no
-SDK, no Visual Studio, and no NuGet:
+Grab `Last.Pld.exe` from Releases and run it. That is the whole install: no
+installer, no admin rights, nothing written outside its own folder except one
+per-user registry value for starting at logon.
+
+It keeps its history **beside the exe**, so the folder you put it in is the
+app. Somewhere like `%USERPROFILE%\Last.Pld\` works well; a folder that gets
+cleaned out, like `Downloads`, does not.
+
+Or build it yourself — the build needs no SDK, no Visual Studio, and no NuGet:
 
     git clone https://github.com/Guardian509/Last.Pld.git
     cd Last.Pld
     build.cmd
 
-That produces `Last.Pld.exe` and `loopcap.exe`. Run the first one.
+That produces `Last.Pld.exe` and `loopcap.exe`. Run the first one; `loopcap.exe`
+is only needed for the optional Identify feature.
 
 ### Optional: enable Identify
 

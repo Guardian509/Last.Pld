@@ -4,18 +4,61 @@ A port of the concept, not of the code. Windows reads the System Media
 Transport Controls; Linux has the same idea in **MPRIS**, published over D-Bus
 by essentially every media player and browser.
 
-One file, `lastpld.py`. **Standard library only** — no pip, no venv, nothing to
-install before the first run. D-Bus is reached through `busctl` (ships with
-systemd) or `gdbus` (ships with glib); if you have a Linux desktop playing
-audio, you already have one.
+**One file.** Download `lastpld.py`, make it executable, run it. It opens a
+window, sits in your tray, and sets itself to start when you log in — so it
+keeps recording for as long as the machine is on and you are logged in.
 
-    ./lastpld.py            start logging (Ctrl-C to stop)
-    ./lastpld.py --probe    show every MPRIS player and why it would or
-                            would not be logged
-    ./lastpld.py --selftest run the built-in tests
+    chmod +x lastpld.py
+    ./lastpld.py
+
+That is the whole install. There is no installer, no package, no service to
+configure, and nothing is copied anywhere: the app is the file you downloaded.
+
+**To uninstall, delete the file.** The autostart entry runs the file where it
+sits, checks that it is still there, and removes itself at the next login if it
+is not. Nothing is left running. Your history stays in
+`~/.local/share/lastpld/` on purpose — deleting the app should not delete your
+listening history. Remove that folder too if you want it gone.
+
+## Dependencies
+
+The recorder is **standard library only** — no pip, no venv, nothing to install
+before the first run. D-Bus is reached through `busctl` (systemd) or `gdbus`
+(glib); if you have a Linux desktop playing audio, you already have one.
+
+The window and tray are optional extras, both distro packages, never pip:
+
+| | |
+|---|---|
+| **Window** | PyGObject with GTK4 and libadwaita. Debian/Ubuntu: `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1`. Fedora: `python3-gobject gtk4 libadwaita`. |
+| **Tray** | `python3-dbus`. Published as a StatusNotifierItem. On GNOME you also need the AppIndicator extension, which most distros ship enabled. |
+
+**Without them the file still records** — it just has no face. It falls back to
+terminal logging automatically, including when started from the autostart entry
+at login, so logging in never silently does nothing.
+
+## Running it
+
+    ./lastpld.py            open the window and start recording
+    ./lastpld.py --background   start in the tray only (what login runs)
+    ./lastpld.py --no-gui       record in the terminal, Ctrl-C to stop
+    ./lastpld.py --probe        show every MPRIS player and why it would or
+                                would not be logged
+    ./lastpld.py --selftest     run the built-in tests
 
 `--probe` is the one to reach for when something isn't logged. It prints what
 each player is publishing and the filter's verdict with its reasoning.
+
+Closing the window hides it to the tray and recording continues — Esc does the
+same. **Quit** in the tray menu stops recording, because with the recorder
+inside the app there is no daemon left behind for it to mean anything else.
+Use the **Logging** checkmark to stop recording but keep the window.
+
+Autostart can be turned off from the tray menu, the window menu, or with
+`--uninstall-autostart`.
+
+For a headless box with no desktop at all, `--install-service` still writes a
+systemd user unit the old way.
 
 ## Where things live
 
@@ -24,18 +67,12 @@ each player is publishing and the filter's verdict with its reasoning.
 | File | What it is |
 |---|---|
 | `lastpld.csv` | History: `timestamp,title,artist,album,app`. |
+| `lastpld.trash.csv` | Rows you moved to the trash, restorable from the window. |
 | `sources.txt` | Which players to log. Created with defaults on first run. |
 | `playlists.txt` | Spotify token. Written `0600`. |
 
 The CSV is **byte-compatible with the Windows build** — same columns, same
 UTF-8 BOM — so histories from both machines can be concatenated or swapped.
-
-## Run it at login
-
-    ./lastpld.py --install-service
-
-Writes and enables `~/.config/systemd/user/lastpld.service`. Check it with
-`systemctl --user status lastpld`.
 
 ## The browser problem, and why Linux solves it better
 
@@ -69,57 +106,13 @@ metadata — reels, games, streams.
 
     ./lastpld.py --identify
 
-Needs a recorder (`pw-record`, `parec`, or `ffmpeg`) and a recogniser. It
-prefers [**SongRec**](https://github.com/marin-m/SongRec), which is native,
-packaged for most distros, and needs no Python packages:
+or the **Identify** button in the window. Needs a recorder (`pw-record`,
+`parec`, or `ffmpeg`) and a recogniser. It prefers
+[**SongRec**](https://github.com/marin-m/SongRec), which is native, packaged
+for most distros, and needs no Python packages:
 
     sudo apt install songrec        # or dnf/pacman
 
 `pip install shazamio` also works if you'd rather. **If neither is present the
-feature is simply unavailable** — it never blocks logging, which is the whole
+feature is simply unavailable** — it never blocks recording, which is the whole
 point of the no-dependency rule.
-
-(Pleasing footnote: SongRec is why this is easier here. It's the tool that
-couldn't be built on Windows — no binary, and its Rust dependencies need the
-full MSYS2 stack — which is what sent the Windows build down the shazamio road
-in the first place.)
-
-## Playlists (optional)
-
-    ./lastpld.py --connect-spotify --client-id <YOUR_CLIENT_ID>
-
-Identified songs then get pushed to a playlist called **Last.Pld**. You need a
-free app from the [Spotify dashboard](https://developer.spotify.com/dashboard)
-with redirect URI `http://127.0.0.1:8888/callback` — **it must be the loopback
-literal, not `localhost`**, which Spotify stopped accepting.
-
-Auth is Authorization Code + PKCE, so there's no client secret. Matching uses
-the ISRC from the recognition, which is an exact lookup rather than a fuzzy
-title search.
-
-Unlike the Windows build there's no DPAPI here, so the token is protected by
-file permissions (`0600`) instead — libsecret would mean a third-party module.
-
-## Differences from the Windows build
-
-| | Windows | Linux |
-|---|---|---|
-| Source | SMTC (WinRT) | MPRIS (D-Bus) |
-| Detection | event-driven, 1–25 ms | 1 s poll |
-| UI | WinForms window + tray | CLI (`--history`, `--search`) |
-| YouTube check | window titles | `xesam:url` domain — better |
-| Token storage | DPAPI | file mode `0600` |
-| Autostart | Scheduled Task | systemd user service |
-
-## Testing
-
-    ./lastpld.py --selftest          26 checks, no D-Bus needed
-
-For a genuine end-to-end run, `tests/mock_mpris.py` publishes a fake player on
-the real session bus:
-
-    python3 tests/mock_mpris.py --name testplayer --title "Song" --artist "Band" &
-    ./lastpld.py --probe
-
-That fixture is the only thing here that needs `python3-dbus` — a test-only
-dependency the app itself never has.

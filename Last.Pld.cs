@@ -27,6 +27,7 @@
 //   Last.Pld.exe              open the history window (and start logging)
 //   Last.Pld.exe /background  start in the tray only, no window
 
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -1262,6 +1263,78 @@ namespace LastPld
 
     // ---------------------------------------------------------------- main
 
+    // ----------------------------------------------------------- autostart
+
+    // One file, one double-click, running from every logon after that. The Run
+    // key is per-user (HKCU), so this needs no elevation and only ever affects
+    // the account that ran the exe.
+    //
+    // The value is rewritten on every launch, which is what makes the exe
+    // portable: move it to another folder, run it once, and the entry follows
+    // it. Deleting the exe stops the app - Windows silently skips a Run entry
+    // whose target is missing - and leaves one inert registry value behind.
+    // /uninstall removes that too.
+    static class AutoStart
+    {
+        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string ValueName = "Last.Pld";
+
+        public static string Command
+        {
+            get { return "\"" + Application.ExecutablePath + "\" /background"; }
+        }
+
+        public static bool Installed
+        {
+            get
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.OpenSubKey(RunKey))
+                        return key != null && key.GetValue(ValueName) != null;
+                }
+                catch { return false; }
+            }
+        }
+
+        public static void Install()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
+                    if (key != null) key.SetValue(ValueName, Command);
+            }
+            catch { }
+        }
+
+        public static void Remove()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                    if (key != null) key.DeleteValue(ValueName, false);
+            }
+            catch { }
+        }
+
+        // Keep the stored command pointing at wherever the exe actually is.
+        public static void Refresh()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    if (key == null) return;
+                    var current = key.GetValue(ValueName) as string;
+                    if (current == null) return;
+                    if (!string.Equals(current, Command, StringComparison.OrdinalIgnoreCase))
+                        key.SetValue(ValueName, Command);
+                }
+            }
+            catch { }
+        }
+    }
+
     static class Program
     {
         const string MutexName = "LastPld.SingleInstance.v1";
@@ -1271,8 +1344,23 @@ namespace LastPld
         static void Main(string[] args)
         {
             bool background = false;
+            bool uninstall = false;
             foreach (var a in args)
+            {
                 if (a.Equals("/background", StringComparison.OrdinalIgnoreCase)) background = true;
+                if (a.Equals("/uninstall", StringComparison.OrdinalIgnoreCase)) uninstall = true;
+            }
+
+            if (uninstall)
+            {
+                AutoStart.Remove();
+                MessageBox.Show(
+                    "Last.Pld will no longer start when you log in.\r\n\r\n" +
+                    "Your history is untouched. Delete Last.Pld.exe to remove " +
+                    "the app itself.",
+                    "Last.Pld", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
 
             bool isFirst;
             var mutex = new Mutex(true, MutexName, out isFirst);
@@ -1294,6 +1382,11 @@ namespace LastPld
             string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
             Store.Init(Path.Combine(exeDir, "lastpld.csv"));
             Filter.Init(exeDir);
+
+            // First run sets itself to start at logon; later runs only correct
+            // the path, so moving the exe does not leave a dead entry behind.
+            if (AutoStart.Installed) AutoStart.Refresh();
+            else AutoStart.Install();
 
             // Durable record of every real launch, so "did it start at logon?"
             // can be answered after the fact rather than guessed at.
@@ -1353,6 +1446,18 @@ namespace LastPld
             {
                 try { System.Diagnostics.Process.Start(Path.GetDirectoryName(Store.Path)); } catch { }
             });
+
+            // Rebuilt on open, so the tick always shows the real registry state.
+            var startup = new ToolStripMenuItem("Start at login");
+            startup.CheckOnClick = true;
+            menu.Opening += (s, e) => startup.Checked = AutoStart.Installed;
+            startup.Click += (s, e) =>
+            {
+                if (startup.Checked) AutoStart.Install();
+                else AutoStart.Remove();
+            };
+            menu.Items.Add(startup);
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (s, e) =>
             {

@@ -5,27 +5,38 @@ The Windows build reads the System Media Transport Controls. Linux has the same
 idea in MPRIS, published over D-Bus by essentially every media player and
 browser, so this is a port of the concept rather than of the code.
 
-Deliberately depends on nothing you have to install. Standard library only: no
-pip, no venv, no third-party modules. D-Bus is reached through `busctl` (ships
-with systemd) or `gdbus` (ships with glib) - whichever is present. If you have a
-Linux desktop playing audio, you already have one of them.
+One file. Download it, make it executable, run it once: it opens a window, puts
+a note in your tray, and sets itself to start when you log in. Delete the file
+and it is gone - the autostart entry notices and removes itself at the next
+login. Your history stays where it is, because it is yours.
+
+Deliberately depends on nothing you have to install. The recorder is standard
+library only: no pip, no venv, no third-party modules. D-Bus is reached through
+`busctl` (ships with systemd) or `gdbus` (ships with glib) - whichever is
+present. If you have a Linux desktop playing audio, you already have one.
 
 Optional extras light up only if the tools happen to exist, and their absence
-never stops the logger:
+never stops the recorder:
 
+    Window     PyGObject (GTK4 + libadwaita), a distro package. Without it the
+               file still records, it just has no face - see --no-gui.
+    Tray       python3-dbus, published as a StatusNotifierItem.
     Identify   songrec, or shazamio on the python path, plus a recorder
                (pw-record / parec / ffmpeg)
     Playlists  nothing - the Spotify client here is stdlib urllib
 
 Usage:
-    lastpld.py                    log in the foreground (Ctrl-C to stop)
+    lastpld.py                    open the window and start recording
+    lastpld.py --background       start in the tray only (what login runs)
+    lastpld.py --no-gui           record in the terminal (Ctrl-C to stop)
     lastpld.py --probe            show what MPRIS players are visible, and why
                                   each one would or would not be logged
     lastpld.py --history 20       print the last 20 tracks
     lastpld.py --search whitney   search the history
     lastpld.py --identify         fingerprint what is playing right now
     lastpld.py --connect-spotify  authorise pushing identified songs to Spotify
-    lastpld.py --install-service  write and enable a systemd user service
+    lastpld.py --install-autostart / --uninstall-autostart
+    lastpld.py --install-service  a systemd user service, for headless boxes
     lastpld.py --selftest         run the built-in tests
 """
 
@@ -41,7 +52,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -521,10 +534,18 @@ class Logger:
         self._seed()
 
     def _seed(self):
-        """Don't re-log the track that was already playing when we started."""
+        """Don't re-log the track that was already playing when we started.
+
+        Seeding _recent alone did not do it: the stamp was DEDUP_SECONDS old
+        the moment it was written, so the "seen recently" test was already
+        false and every restart re-logged whatever was playing. What actually
+        answers the question is _last_per_app - if the newest row for an app
+        is still the track it is playing, we have that play already.
+        """
         now = time.time()
         for row in self.store.rows()[-200:]:
-            self._recent[(row[4], row[1], row[2])] = now - DEDUP_SECONDS
+            self._recent[(row[4], row[1], row[2])] = now
+            self._last_per_app[row[4]] = (row[1], row[2])
 
     def identity(self, service):
         if service not in self._identity_cache:
@@ -1324,6 +1345,14 @@ def selftest():
         check("new track logged", len(logger.tick()) == 1)
         check("history has exactly two rows", len(store.rows()) == 2,
               str(store.rows()))
+
+        # A restart mid-song must not log that song again. The app now quits
+        # and starts with the window, so this happens often enough to notice.
+        restarted = Logger(store, Filter(["spotify"]), FakeBus(props), verbose=False)
+        check("restart does not re-log what is already playing",
+              len(restarted.tick()) == 0)
+        check("still exactly two rows after a restart", len(store.rows()) == 2,
+              str(store.rows()))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1382,6 +1411,1241 @@ def do_identify():
         print(note)
     return 0
 
+# ------------------------------------------------------------------ desktop
+#
+# Everything below is the optional desktop front end. It is guarded by the
+# import that follows: if PyGObject is not installed the file still runs, it
+# just logs headlessly. That is the whole no-dependency promise - the GUI is a
+# bonus where the desktop stack happens to exist, never a requirement.
+#
+# Importing Gtk does not open a display; only Gtk.init() does, and that happens
+# inside Adw.Application.run(). A headless service pays a few milliseconds.
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango, PangoCairo
+    import cairo
+
+    HAVE_GTK = True
+except (ImportError, ValueError):
+    HAVE_GTK = False
+
+try:
+    import dbus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+
+    HAVE_DBUS = True
+except ImportError:
+    HAVE_DBUS = False
+
+
+APP_ID = "io.github.guardian509.LastPld"
+ACCENT = "#fa5a64"          # the red the Windows build draws its icon in
+ICON_NAME = "lastpld"
+
+
+def gui_possible():
+    return HAVE_GTK and bool(os.environ.get("WAYLAND_DISPLAY") or
+                             os.environ.get("DISPLAY"))
+
+
+# ------------------------------------------------------------- old service
+
+def retire_old_service():
+    """Earlier versions logged from a systemd unit. This one logs in-process.
+
+    Leaving both running would double-log every track, so the unit is stood
+    down the first time the app starts. Nothing is removed that the user did
+    not get from us in the first place.
+    """
+    unit = os.path.expanduser("~/.config/systemd/user/lastpld.service")
+    if not os.path.exists(unit) or not shutil.which("systemctl"):
+        return False
+    for argv in (["systemctl", "--user", "disable", "--now", "lastpld.service"],):
+        try:
+            subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return False
+    try:
+        os.remove(unit)
+        subprocess.run(["systemctl", "--user", "daemon-reload"],
+                       capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return True
+
+
+# -------------------------------------------------------------- autostart
+#
+# The desktop entry runs the file where it sits. Move the file and re-run it
+# once and the entry is rewritten; delete the file and the entry deletes
+# itself at the next login rather than failing forever in the background.
+
+AUTOSTART_DESKTOP = """\
+[Desktop Entry]
+Type=Application
+Name=Last.Pld
+Comment=Records what you actually played
+Exec=sh -c 'test -x "{exe}" && exec "{exe}" --background || rm -f "{entry}"'
+Icon={icon}
+Terminal=false
+Categories=AudioVideo;Audio;
+X-GNOME-Autostart-enabled=true
+"""
+
+LAUNCHER_DESKTOP = """\
+[Desktop Entry]
+Type=Application
+Name=Last.Pld
+Comment=Records what you actually played
+Exec="{exe}"
+Icon={icon}
+Terminal=false
+Categories=AudioVideo;Audio;
+"""
+
+
+def autostart_path():
+    return os.path.join(user_config_dir(), "autostart", "lastpld.desktop")
+
+
+def launcher_path():
+    return os.path.join(user_data_base(), "applications", "lastpld.desktop")
+
+
+def user_config_dir():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def user_data_base():
+    return os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+
+
+def install_autostart(quiet=False):
+    exe = os.path.abspath(__file__)
+    try:
+        os.chmod(exe, 0o755)
+    except OSError:
+        pass
+    write_icon()
+    pairs = ((autostart_path(), AUTOSTART_DESKTOP), (launcher_path(), LAUNCHER_DESKTOP))
+    for path, template in pairs:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(template.format(exe=exe, entry=autostart_path(), icon=ICON_NAME))
+            os.chmod(path, 0o755)
+        except OSError as exc:
+            if not quiet:
+                print("could not write %s: %s" % (path, exc), file=sys.stderr)
+            return 1
+    if not quiet:
+        print("Last.Pld will start automatically when you log in.")
+        print("  %s" % autostart_path())
+    return 0
+
+
+def uninstall_autostart():
+    for path in (autostart_path(), launcher_path()):
+        try:
+            os.remove(path)
+            print("removed %s" % path)
+        except OSError:
+            pass
+    print("\nYour history is untouched: %s" % data_dir())
+    print("Delete this file to remove the app itself.")
+    return 0
+
+
+def autostart_installed():
+    return os.path.exists(autostart_path())
+
+
+def write_icon():
+    """A ♫ in the accent colour, so the tray and launcher have a face."""
+    base = os.path.join(user_data_base(), "icons")
+    target = os.path.join(base, "hicolor", "scalable", "apps", ICON_NAME + ".svg")
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" '
+        'viewBox="0 0 48 48">\n'
+        '  <text x="24" y="37" text-anchor="middle" font-family="sans-serif" '
+        'font-size="38" font-weight="bold" fill="%s">♫</text>\n'
+        '</svg>\n' % ACCENT
+    )
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(svg)
+        index = os.path.join(base, "hicolor", "index.theme")
+        if not os.path.exists(index):
+            with open(index, "w", encoding="utf-8") as fh:
+                fh.write("[Icon Theme]\nName=hicolor\nDirectories=scalable/apps\n\n"
+                         "[scalable/apps]\nSize=48\nType=Scalable\n"
+                         "Context=Applications\n")
+    except OSError:
+        return None
+    return base
+
+
+# ------------------------------------------------------------------ trash
+
+class History:
+    """The CSV, plus moving rows in and out of the trash file.
+
+    Rows are matched by value, not by index: the recorder appends while the
+    window is open, so a row's position is not stable between a read and the
+    rewrite that follows it.
+    """
+
+    def __init__(self, store):
+        self.store = store
+
+    @property
+    def path(self):
+        return self.store.path
+
+    @property
+    def trash_path(self):
+        return self.store.trash_path
+
+    @staticmethod
+    def _read(path):
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+            out = []
+            for i, row in enumerate(csv.reader(fh)):
+                if i == 0 and row and row[0].lower().lstrip("﻿") == "timestamp":
+                    continue
+                if len(row) >= 5:
+                    out.append(row)
+            return out
+
+    @staticmethod
+    def _write(path, rows):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(CSV_HEADER)
+            writer.writerows(rows)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _append(path, rows):
+        exists = os.path.exists(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            if not exists:
+                writer.writerow(CSV_HEADER)
+            writer.writerows(rows)
+
+    def rows(self):
+        return self._read(self.path)
+
+    def trash_rows(self):
+        return self._read(self.trash_path)
+
+    def _move(self, source, target, rows):
+        pending = [tuple(r) for r in rows]
+        if not pending:
+            return
+        keep, moved = [], []
+        for row in self._read(source):
+            key = tuple(row)
+            if key in pending:
+                pending.remove(key)
+                moved.append(row)
+            else:
+                keep.append(row)
+        if not moved:
+            return
+        self._append(target, moved)
+        self._write(source, keep)
+
+    def to_trash(self, rows):
+        self._move(self.path, self.trash_path, rows)
+
+    def restore(self, rows):
+        self._move(self.trash_path, self.path, rows)
+
+    def purge(self, rows):
+        gone = [tuple(r) for r in rows]
+        self._write(self.trash_path,
+                    [r for r in self._read(self.trash_path) if tuple(r) not in gone])
+
+    def empty_trash(self):
+        self._write(self.trash_path, [])
+
+
+# --------------------------------------------------------------- recorder
+
+if HAVE_GTK:
+
+    class Recorder(GObject.Object):
+        """Runs the logger on a worker thread inside the GUI process.
+
+        One process does both jobs, the way the Windows build does. Pausing
+        stops the writing but keeps the polling, so the now-playing banner
+        stays live while logging is off.
+        """
+
+        __gsignals__ = {
+            "now-playing": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
+            "logged": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        }
+
+        def __init__(self, store, bus):
+            GObject.Object.__init__(self)
+            self.logger = Logger(store, Filter.load(), bus, verbose=False)
+            self.paused = Settings.get("logging", "1") != "1"
+            self._stop = threading.Event()
+            self._current = None
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+        def stop(self):
+            self._stop.set()
+
+        def set_paused(self, paused):
+            self.paused = bool(paused)
+            Settings.set("logging", "0" if self.paused else "1")
+
+        def _loop(self):
+            complained = False
+            while not self._stop.wait(POLL_SECONDS):
+                try:
+                    playing = self._tick()
+                except DBusError:
+                    playing = None                  # a player went away mid-read
+                except Exception:
+                    # Anything else is a bug in here. Say so once; swallowing it
+                    # silently just looks like "nothing is ever playing".
+                    playing = None
+                    if not complained:
+                        complained = True
+                        traceback.print_exc()
+
+                key = None if playing is None else (playing.title, playing.artist,
+                                                    playing.app)
+                if key != self._current:
+                    self._current = key
+                    GLib.idle_add(self.emit, "now-playing", playing)
+
+        def _tick(self):
+            if not self.paused:
+                if self.logger.tick():
+                    GLib.idle_add(self.emit, "logged")
+
+            # snapshot() is what tick() itself reads, so the banner shows exactly
+            # what the logger sees - including players the filter will not log.
+            for track in self.logger.snapshot():
+                return track
+            return None
+
+
+    # ------------------------------------------------------------------ icon
+
+    def _icon_surface(size):
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+        ctx = cairo.Context(surface)
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+
+        layout = PangoCairo.create_layout(ctx)
+        layout.set_font_description(
+            Pango.FontDescription("Sans Bold %d" % max(8, int(size * 0.72))))
+        layout.set_text("♫", -1)
+        ink, logical = layout.get_pixel_extents()
+        width = ink.width or logical.width or size
+        height = ink.height or logical.height or size
+        ctx.set_source_rgb(0xfa / 255.0, 0x5a / 255.0, 0x64 / 255.0)
+        ctx.move_to((size - width) / 2.0 - ink.x, (size - height) / 2.0 - ink.y)
+        PangoCairo.show_layout(ctx, layout)
+        surface.flush()
+        return surface
+
+
+    def icon_pixmap(size=32):
+        """SNI wants width, height, then ARGB32 in network byte order."""
+        surface = _icon_surface(size)
+        data = bytes(surface.get_data())
+        stride = surface.get_stride()
+        out = bytearray(size * size * 4)
+        at = 0
+        for y in range(size):
+            row = data[y * stride:y * stride + size * 4]
+            for x in range(0, size * 4, 4):
+                # cairo hands back premultiplied BGRA on a little-endian machine
+                blue, green, red, alpha = row[x], row[x + 1], row[x + 2], row[x + 3]
+                out[at], out[at + 1], out[at + 2], out[at + 3] = alpha, red, green, blue
+                at += 4
+        return dbus.Struct((dbus.Int32(size), dbus.Int32(size),
+                            dbus.ByteArray(bytes(out))), signature="iiay")
+
+
+# -------------------------------------------------------------- dbus menu
+
+if HAVE_DBUS and HAVE_GTK:
+
+    DBUSMENU_IFACE = "com.canonical.dbusmenu"
+    SNI_IFACE = "org.kde.StatusNotifierItem"
+
+    class MenuItem:
+        _next_id = 1
+
+        def __init__(self, label="", callback=None, kind="standard",
+                     toggle=None, enabled=True, children=None):
+            self.id = MenuItem._next_id
+            MenuItem._next_id += 1
+            self.label = label
+            self.callback = callback
+            self.kind = kind                # "standard" or "separator"
+            self.toggle = toggle            # None, or True/False for a checkmark
+            self.enabled = enabled
+            self.children = children or []
+
+        def properties(self):
+            if self.kind == "separator":
+                return dbus.Dictionary({"type": dbus.String("separator")},
+                                       signature="sv")
+            props = {
+                "label": dbus.String(self.label),
+                "enabled": dbus.Boolean(self.enabled),
+                "visible": dbus.Boolean(True),
+            }
+            if self.toggle is not None:
+                props["toggle-type"] = dbus.String("checkmark")
+                props["toggle-state"] = dbus.Int32(1 if self.toggle else 0)
+            if self.children:
+                props["children-display"] = dbus.String("submenu")
+            return dbus.Dictionary(props, signature="sv")
+
+        def node(self):
+            return dbus.Struct(
+                (dbus.Int32(self.id), self.properties(),
+                 dbus.Array([c.node() for c in self.children], signature="v")),
+                signature="ia{sv}av")
+
+        def walk(self):
+            yield self
+            for child in self.children:
+                for item in child.walk():
+                    yield item
+
+
+    class DBusMenu(dbus.service.Object):
+        """Just enough of com.canonical.dbusmenu for a tray menu."""
+
+        def __init__(self, bus_name, path, build):
+            dbus.service.Object.__init__(self, bus_name, path)
+            self._build = build
+            self._revision = 1
+            self._items = build()
+
+        def rebuild(self):
+            """Rebuilt before it opens, so the checkmark is never stale."""
+            MenuItem._next_id = 1
+            self._items = self._build()
+            self._revision += 1
+            self.LayoutUpdated(dbus.UInt32(self._revision), dbus.Int32(0))
+
+        def _root(self):
+            root = MenuItem()
+            root.id = 0
+            root.children = self._items
+            return root
+
+        def _find(self, wanted):
+            for item in self._root().walk():
+                if item.id == wanted:
+                    return item
+            return None
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="iias",
+                             out_signature="u(ia{sv}av)")
+        def GetLayout(self, parent_id, recursion_depth, property_names):
+            item = self._find(parent_id) or self._root()
+            return dbus.UInt32(self._revision), item.node()
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="aias",
+                             out_signature="a(ia{sv})")
+        def GetGroupProperties(self, ids, property_names):
+            return dbus.Array(
+                [dbus.Struct((dbus.Int32(i.id), i.properties()), signature="ia{sv}")
+                 for i in self._root().walk() if not ids or i.id in ids],
+                signature="(ia{sv})")
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="is", out_signature="v")
+        def GetProperty(self, item_id, name):
+            item = self._find(item_id)
+            if item is None:
+                return dbus.String("")
+            return item.properties().get(name, dbus.String(""))
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="isvu", out_signature="")
+        def Event(self, item_id, event_id, data, timestamp):
+            if event_id != "clicked":
+                return
+            item = self._find(item_id)
+            if item is not None and item.callback is not None:
+                GLib.idle_add(item.callback)
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="a(isvu)", out_signature="ai")
+        def EventGroup(self, events):
+            for item_id, event_id, data, timestamp in events:
+                self.Event(item_id, event_id, data, timestamp)
+            return dbus.Array([], signature="i")
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="i", out_signature="b")
+        def AboutToShow(self, item_id):
+            self.rebuild()
+            return True
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="ai", out_signature="aiai")
+        def AboutToShowGroup(self, ids):
+            self.rebuild()
+            return dbus.Array([], signature="i"), dbus.Array([], signature="i")
+
+        @dbus.service.signal(DBUSMENU_IFACE, signature="ui")
+        def LayoutUpdated(self, revision, parent):
+            pass
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss",
+                             out_signature="v")
+        def Get(self, interface, name):
+            return self.GetAll(interface).get(name, dbus.String(""))
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s",
+                             out_signature="a{sv}")
+        def GetAll(self, interface):
+            return dbus.Dictionary({
+                "Version": dbus.UInt32(3),
+                "TextDirection": dbus.String("ltr"),
+                "Status": dbus.String("normal"),
+                "IconThemePath": dbus.Array([], signature="s"),
+            }, signature="sv")
+
+
+    class Tray(dbus.service.Object):
+        """A StatusNotifierItem, published directly.
+
+        libappindicator would have been less code, but it is GTK3-only and
+        cannot be loaded into a GTK4 process.
+        """
+
+        def __init__(self, build_menu, on_activate):
+            self._on_activate = on_activate
+            self._tooltip = "Last.Pld - logging"
+            self._theme_path = write_icon()
+            self._pixmap = None
+
+            bus = dbus.SessionBus()
+            name = "org.kde.StatusNotifierItem-%d-1" % os.getpid()
+            self._bus_name = dbus.service.BusName(name, bus)
+            dbus.service.Object.__init__(self, self._bus_name, "/StatusNotifierItem")
+            self.menu = DBusMenu(self._bus_name, "/StatusNotifierMenu", build_menu)
+            self.registered = self._register(bus, name)
+
+        def _register(self, bus, name):
+            try:
+                watcher = bus.get_object("org.kde.StatusNotifierWatcher",
+                                         "/StatusNotifierWatcher")
+                watcher.RegisterStatusNotifierItem(
+                    name, dbus_interface="org.kde.StatusNotifierWatcher")
+                return True
+            except dbus.DBusException:
+                # No watcher: a desktop without tray support, or GNOME without
+                # the AppIndicator extension. The window still works.
+                return False
+
+        def set_tooltip(self, text):
+            text = text or "Last.Pld - logging"
+            if text == self._tooltip:
+                return
+            self._tooltip = text
+            try:
+                self.NewToolTip()
+            except dbus.DBusException:
+                pass
+
+        def _icon_pixmap(self):
+            if self._pixmap is None:
+                self._pixmap = dbus.Array([icon_pixmap(32)], signature="(iiay)")
+            return self._pixmap
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def Activate(self, x, y):
+            GLib.idle_add(self._on_activate)
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def SecondaryActivate(self, x, y):
+            GLib.idle_add(self._on_activate)
+
+        @dbus.service.method(SNI_IFACE, in_signature="is", out_signature="")
+        def Scroll(self, delta, orientation):
+            pass
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def ContextMenu(self, x, y):
+            self.menu.rebuild()
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewIcon(self):
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewToolTip(self):
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="s")
+        def NewStatus(self, status):
+            pass
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss",
+                             out_signature="v")
+        def Get(self, interface, name):
+            return self.GetAll(interface).get(name, dbus.String(""))
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s",
+                             out_signature="a{sv}")
+        def GetAll(self, interface):
+            props = {
+                "Category": dbus.String("ApplicationStatus"),
+                "Id": dbus.String("lastpld"),
+                "Title": dbus.String("Last.Pld"),
+                "Status": dbus.String("Active"),
+                "WindowId": dbus.Int32(0),
+                "IconName": dbus.String(ICON_NAME),
+                "IconPixmap": self._icon_pixmap(),
+                "OverlayIconName": dbus.String(""),
+                "AttentionIconName": dbus.String(""),
+                "ItemIsMenu": dbus.Boolean(False),
+                "Menu": dbus.ObjectPath("/StatusNotifierMenu"),
+                "ToolTip": dbus.Struct(
+                    (dbus.String(ICON_NAME), dbus.Array([], signature="(iiay)"),
+                     dbus.String("Last.Pld"), dbus.String(self._tooltip)),
+                    signature="sa(iiay)ss"),
+            }
+            if self._theme_path:
+                props["IconThemePath"] = dbus.String(self._theme_path)
+            return dbus.Dictionary(props, signature="sv")
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ssv",
+                             out_signature="")
+        def Set(self, interface, name, value):
+            pass
+
+
+# ----------------------------------------------------------------- window
+
+if HAVE_GTK:
+
+    class Row(GObject.Object):
+        __gtype_name__ = "LastPldRow"
+
+        def __init__(self, values):
+            GObject.Object.__init__(self)
+            self.values = list(values)
+
+        when = property(lambda self: self.values[0])
+        title = property(lambda self: self.values[1])
+        artist = property(lambda self: self.values[2])
+        album = property(lambda self: self.values[3])
+        source = property(lambda self: self.values[4])
+
+
+    CSS = """
+    .nowplaying { padding: 14px 18px; border-bottom: 1px solid alpha(currentColor, 0.12); }
+    .nowplaying-title { font-size: 15pt; font-weight: bold; color: %s; }
+    .nowplaying-sub { opacity: 0.7; }
+    .dim { opacity: 0.6; }
+    """ % ACCENT
+
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app, history, recorder):
+            Adw.ApplicationWindow.__init__(self, application=app)
+            self.history = history
+            self.recorder = recorder
+            self.viewing_trash = False
+            self._identifying = False
+            self._reload_pending = False
+
+            self.set_title("Last.Pld")
+            self.set_default_size(1120, 640)
+            self.set_icon_name(ICON_NAME)
+
+            self.store = Gio.ListStore(item_type=Row)
+            self.filter = Gtk.CustomFilter.new(self._match)
+            filtered = Gtk.FilterListModel(model=self.store, filter=self.filter)
+            self.selection = Gtk.MultiSelection(model=filtered)
+
+            toolbar = Adw.ToolbarView()
+            toolbar.add_top_bar(self._header())
+            toolbar.set_content(self._content())
+            self.set_content(toolbar)
+
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self._on_key)
+            self.add_controller(keys)
+            self.connect("close-request", self._on_close)
+
+            recorder.connect("now-playing", self._on_now_playing)
+            recorder.connect("logged", lambda *_: self.reload())
+            self.reload()
+
+        # ---- chrome
+
+        def _header(self):
+            header = Adw.HeaderBar()
+            self.window_title = Adw.WindowTitle.new("Last.Pld", "play history")
+            header.set_title_widget(self.window_title)
+
+            self.search_button = Gtk.ToggleButton(icon_name="system-search-symbolic")
+            self.search_button.set_tooltip_text("Search (Ctrl+F)")
+            self.search_button.connect("toggled", self._on_search_toggled)
+            header.pack_start(self.search_button)
+
+            self.trash_button = Gtk.ToggleButton(icon_name="user-trash-symbolic")
+            self.trash_button.set_tooltip_text("Trash")
+            self.trash_button.connect("toggled", self._on_trash_toggled)
+            header.pack_start(self.trash_button)
+
+            self.identify_button = Gtk.Button(label="Identify")
+            self.identify_button.add_css_class("suggested-action")
+            self.identify_button.set_tooltip_text("Fingerprint what is playing now")
+            self.identify_button.connect("clicked", lambda *_: self.identify_now())
+            header.pack_end(self.identify_button)
+
+            menu = Gio.Menu()
+            section = Gio.Menu()
+            section.append("Open CSV", "win.open-csv")
+            section.append("Open folder", "win.open-folder")
+            menu.append_section(None, section)
+            section = Gio.Menu()
+            section.append("Pause logging", "win.toggle-logging")
+            section.append("Edit sources…", "win.edit-sources")
+            section.append("Start at login", "win.toggle-autostart")
+            menu.append_section(None, section)
+            section = Gio.Menu()
+            section.append("Connect Spotify…", "win.spotify")
+            section.append("Why not Apple Music?", "win.apple")
+            menu.append_section(None, section)
+            header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic",
+                                           menu_model=menu))
+
+            for name, handler in (
+                ("open-csv", lambda *_: self._open(self.history.path)),
+                ("open-folder", lambda *_: self._open(os.path.dirname(self.history.path))),
+                ("toggle-logging", lambda *_: self.toggle_logging()),
+                ("edit-sources", lambda *_: self._open(path_in_data("sources.txt"))),
+                ("toggle-autostart", lambda *_: self.toggle_autostart()),
+                ("spotify", lambda *_: self.spotify_setup()),
+                ("apple", lambda *_: self._apple_music_note()),
+                ("copy-row", lambda *_: self.copy_selected()),
+                ("search-apple", lambda *_: self.search_apple_music()),
+                ("trash-row", lambda *_: self.trash_selected()),
+                ("restore-row", lambda *_: self.restore_selected()),
+                ("purge-row", lambda *_: self.purge_selected()),
+                ("empty-trash", lambda *_: self.empty_trash()),
+            ):
+                action = Gio.SimpleAction.new(name, None)
+                action.connect("activate", handler)
+                self.add_action(action)
+            return header
+
+        def _content(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+            banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            banner.add_css_class("nowplaying")
+            self.now_title = Gtk.Label(xalign=0, label="Nothing playing")
+            self.now_title.add_css_class("nowplaying-title")
+            self.now_title.set_ellipsize(Pango.EllipsizeMode.END)
+            self.now_sub = Gtk.Label(xalign=0, label="waiting for a player")
+            self.now_sub.add_css_class("nowplaying-sub")
+            self.now_sub.set_ellipsize(Pango.EllipsizeMode.END)
+            banner.append(self.now_title)
+            banner.append(self.now_sub)
+            box.append(banner)
+
+            self.search_bar = Gtk.SearchBar()
+            self.search_entry = Gtk.SearchEntry(
+                placeholder_text="Search title, artist, album")
+            self.search_entry.set_hexpand(True)
+            self.search_entry.connect("search-changed", lambda *_: self._refilter())
+            bar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            bar_box.append(self.search_entry)
+            self.source_dropdown = Gtk.DropDown.new_from_strings(["All sources"])
+            self.source_dropdown.connect("notify::selected",
+                                         lambda *_: self._refilter())
+            bar_box.append(self.source_dropdown)
+            self.search_bar.set_child(bar_box)
+            self.search_bar.connect_entry(self.search_entry)
+            box.append(self.search_bar)
+
+            self.column_view = Gtk.ColumnView(model=self.selection)
+            self.column_view.set_vexpand(True)
+            for title, getter, expand in (
+                ("When", lambda r: r.when, False),
+                ("Title", lambda r: r.title, True),
+                ("Artist", lambda r: r.artist, True),
+                ("Album", lambda r: r.album, True),
+                ("Source", lambda r: r.source, False),
+            ):
+                self.column_view.append_column(self._column(title, getter, expand))
+            self.column_view.connect("activate", self._on_activate_row)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_child(self.column_view)
+            scroller.set_vexpand(True)
+            box.append(scroller)
+
+            self.status = Gtk.Label(xalign=0, label="")
+            self.status.add_css_class("dim")
+            self.status.set_margin_top(6)
+            self.status.set_margin_bottom(6)
+            self.status.set_margin_start(14)
+            box.append(self.status)
+
+            self.row_menu = Gtk.PopoverMenu()
+            self.row_menu.set_parent(self.column_view)
+            self.row_menu.set_has_arrow(False)
+            gesture = Gtk.GestureClick()
+            gesture.set_button(3)
+            gesture.connect("pressed", self._on_right_click)
+            self.column_view.add_controller(gesture)
+            return box
+
+        @staticmethod
+        def _column(title, getter, expand):
+            factory = Gtk.SignalListItemFactory()
+
+            def setup(_factory, item):
+                label = Gtk.Label(xalign=0)
+                label.set_ellipsize(Pango.EllipsizeMode.END)
+                item.set_child(label)
+
+            def bind(_factory, item):
+                item.get_child().set_text(getter(item.get_item()) or "")
+
+            factory.connect("setup", setup)
+            factory.connect("bind", bind)
+            column = Gtk.ColumnViewColumn(title=title, factory=factory)
+            column.set_expand(expand)
+            column.set_resizable(True)
+            return column
+
+        # ---- keys and menus
+
+        def _on_key(self, _controller, keyval, _code, state):
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            if ctrl and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                self.search_button.set_active(True)
+                self.search_entry.grab_focus()
+                return True
+            if keyval == Gdk.KEY_Escape:
+                # Esc clears a search if there is one, otherwise drops to the
+                # tray. Recording carries on either way.
+                if self.search_entry.get_text():
+                    self.search_entry.set_text("")
+                elif self.search_button.get_active():
+                    self.search_button.set_active(False)
+                else:
+                    self.set_visible(False)
+                return True
+            if keyval == Gdk.KEY_Delete:
+                self.purge_selected() if self.viewing_trash else self.trash_selected()
+                return True
+            return False
+
+        def _on_right_click(self, _gesture, _n, x, y):
+            menu = Gio.Menu()
+            if self.viewing_trash:
+                menu.append("Restore", "win.restore-row")
+                section = Gio.Menu()
+                section.append("Delete permanently  (Del)", "win.purge-row")
+                section.append("Empty trash", "win.empty-trash")
+                menu.append_section(None, section)
+            else:
+                menu.append('Copy "Artist — Title"', "win.copy-row")
+                menu.append("Search on Apple Music", "win.search-apple")
+                section = Gio.Menu()
+                section.append("Move to trash  (Del)", "win.trash-row")
+                menu.append_section(None, section)
+            self.row_menu.set_menu_model(menu)
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            self.row_menu.set_pointing_to(rect)
+            self.row_menu.popup()
+
+        # ---- data
+
+        def reload(self):
+            rows = (self.history.trash_rows() if self.viewing_trash
+                    else self.history.rows())
+            rows = list(reversed(rows))              # newest first
+            self.store.remove_all()
+            for row in rows:
+                self.store.append(Row(row))
+            self._rebuild_sources(rows)
+            self._refilter()
+
+        def _rebuild_sources(self, rows):
+            seen = []
+            for row in rows:
+                if row[4] and row[4] not in seen:
+                    seen.append(row[4])
+            seen.sort(key=str.lower)
+            current = self._selected_source()
+            self.source_dropdown.set_model(Gtk.StringList.new(["All sources"] + seen))
+            self.source_dropdown.set_selected(
+                seen.index(current) + 1 if current in seen else 0)
+
+        def _selected_source(self):
+            model = self.source_dropdown.get_model()
+            index = self.source_dropdown.get_selected()
+            if model is None or index in (0, Gtk.INVALID_LIST_POSITION):
+                return None
+            return model.get_string(index)
+
+        def _match(self, row, *_):
+            source = self._selected_source()
+            if source and row.source != source:
+                return False
+            needle = self.search_entry.get_text().strip().lower()
+            if not needle:
+                return True
+            return any(needle in (value or "").lower()
+                       for value in (row.title, row.artist, row.album, row.source))
+
+        def _refilter(self):
+            self.filter.changed(Gtk.FilterChange.DIFFERENT)
+            shown, total = self.selection.get_n_items(), self.store.get_n_items()
+            where = "trash" if self.viewing_trash else "plays"
+            paused = "" if not self.recorder.paused else "  ·  logging paused"
+            self.status.set_text(("%d %s%s" % (total, where, paused)) if shown == total
+                                 else ("%d of %d %s%s" % (shown, total, where, paused)))
+
+        def selected_rows(self):
+            return [self.selection.get_item(i).values
+                    for i in range(self.selection.get_n_items())
+                    if self.selection.is_selected(i)]
+
+        # ---- row commands
+
+        def copy_selected(self):
+            rows = self.selected_rows()
+            if not rows:
+                return
+            self.get_clipboard().set("\n".join(
+                ("%s — %s" % (r[2], r[1])) if r[2] else r[1] for r in rows))
+            self._toast("Copied")
+
+        def search_apple_music(self):
+            rows = self.selected_rows()
+            if not rows:
+                return
+            term = urllib.parse.quote((rows[0][2] + " " + rows[0][1]).strip())
+            self._open("https://music.apple.com/us/search?term=" + term)
+
+        def trash_selected(self):
+            rows = self.selected_rows()
+            if not rows:
+                return
+            self.history.to_trash(rows)
+            self.reload()
+            self._toast("Moved %d to trash" % len(rows))
+
+        def restore_selected(self):
+            rows = self.selected_rows()
+            if not rows:
+                return
+            self.history.restore(rows)
+            self.reload()
+            self._toast("Restored %d" % len(rows))
+
+        def purge_selected(self):
+            rows = self.selected_rows()
+            if not rows:
+                return
+            self._confirm("Delete permanently?",
+                          "%d row(s) will be gone for good." % len(rows),
+                          lambda: (self.history.purge(rows), self.reload()))
+
+        def empty_trash(self):
+            self._confirm("Empty the trash?",
+                          "Everything in the trash will be gone for good.",
+                          lambda: (self.history.empty_trash(), self.reload()))
+
+        def _on_activate_row(self, _view, _position):
+            self.restore_selected() if self.viewing_trash else self.search_apple_music()
+
+        # ---- toggles
+
+        def _on_search_toggled(self, button):
+            self.search_bar.set_search_mode(button.get_active())
+            if button.get_active():
+                self.search_entry.grab_focus()
+
+        def _on_trash_toggled(self, button):
+            self.viewing_trash = button.get_active()
+            self.window_title.set_subtitle("trash" if self.viewing_trash
+                                           else "play history")
+            self.reload()
+
+        def toggle_logging(self):
+            self.recorder.set_paused(not self.recorder.paused)
+            self._toast("Logging paused" if self.recorder.paused else "Logging on")
+
+        def toggle_autostart(self):
+            if autostart_installed():
+                uninstall_autostart()
+                self._toast("Will no longer start at login")
+            else:
+                install_autostart(quiet=True)
+                self._toast("Will start at login")
+
+        # ---- identify
+
+        def identify_now(self):
+            if self._identifying:
+                return
+            self.present()
+            self._identifying = True
+            self.identify_button.set_label("Listening…")
+            self.identify_button.set_sensitive(False)
+
+            def work():
+                try:
+                    result = Identify.run()
+                except Exception as exc:
+                    result = {"matched": False, "error": str(exc)}
+                GLib.idle_add(done, result)
+
+            def done(result):
+                self._identifying = False
+                self.identify_button.set_label("Identify")
+                self.identify_button.set_sensitive(True)
+                if not result.get("matched"):
+                    self._alert("No match",
+                                result.get("error", "nothing recognised"))
+                    return False
+                track = Track(result["title"], result.get("artist", ""),
+                              result.get("album", ""), "Shazam")
+                self.history.store.append(track)
+                Playlists.add_everywhere(track, result.get("isrc", ""))
+                self.reload()
+                self._alert(result["title"],
+                            "\n".join(x for x in (result.get("artist", ""),
+                                                  result.get("album", ""),
+                                                  "Added to your history.") if x))
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        # ---- spotify
+
+        def spotify_setup(self):
+            if Spotify.connected():
+                self._confirm("Disconnect Spotify?",
+                              "Nothing further will be added to your playlist.",
+                              lambda: (Spotify.disconnect(), self._toast("Disconnected")))
+                return
+            self._alert(
+                "Connect Spotify",
+                "Spotify needs a free developer app, and the connect flow opens "
+                "a browser and waits on a local redirect. Run it from a "
+                "terminal:\n\n    %s --connect-spotify\n\nOnce connected this "
+                "menu offers to disconnect instead." % os.path.abspath(__file__))
+
+        def _apple_music_note(self):
+            self._alert(
+                "Why not Apple Music?",
+                "Apple Music has no playlist API a desktop app can use without "
+                "a paid Apple Developer account and a MusicKit token, and the "
+                "token cannot be issued from the app itself.\n\n"
+                "Capturing the plays is the part Apple does not do for you, and "
+                "that works: radio tracks land in the CSV either way.")
+
+        # ---- small helpers
+
+        def _toast(self, text):
+            self.status.set_text(text)
+            GLib.timeout_add_seconds(3, lambda: (self._refilter(), False)[1])
+
+        def _dialog(self, heading, body):
+            """libadwaita renamed MessageDialog to AlertDialog; support both."""
+            if hasattr(Adw, "AlertDialog"):
+                dialog = Adw.AlertDialog(heading=heading, body=body)
+                return dialog, lambda: dialog.present(self)
+            dialog = Adw.MessageDialog(heading=heading, body=body,
+                                       transient_for=self, modal=True)
+            return dialog, dialog.present
+
+        def _alert(self, heading, body):
+            dialog, show = self._dialog(heading, body)
+            dialog.add_response("ok", "OK")
+            show()
+
+        def _confirm(self, heading, body, on_yes):
+            dialog, show = self._dialog(heading, body)
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("go", "Delete")
+            dialog.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.connect("response",
+                           lambda _d, response: on_yes() if response == "go" else None)
+            show()
+
+        def _open(self, target):
+            if not target:
+                return
+            if not target.startswith("http"):
+                target = Gio.File.new_for_path(target).get_uri()
+            Gtk.UriLauncher.new(target).launch(self, None, None, None)
+
+        def _on_now_playing(self, _source, track):
+            if track is None:
+                self.now_title.set_text("Nothing playing")
+                self.now_sub.set_text("waiting for a player")
+                return
+            self.now_title.set_text(track.title)
+            detail = " · ".join(x for x in (track.artist, track.album) if x)
+            self.now_sub.set_text(("%s — %s" % (detail, track.app)) if detail
+                                  else track.app)
+
+        def _on_close(self, *_args):
+            # Closing hides to the tray so recording continues; Quit comes from
+            # the tray menu. The Windows build behaves the same way.
+            self.set_visible(False)
+            return True
+
+
+    # ------------------------------------------------------------ application
+
+    class Application(Adw.Application):
+        def __init__(self, background):
+            Adw.Application.__init__(self, application_id=APP_ID,
+                                     flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+            self.background = background
+            self.window = None
+            self.tray = None
+            self.recorder = None
+
+        def do_startup(self):
+            Adw.Application.do_startup(self)
+
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS.encode())
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+            retire_old_service()
+            store = Store()
+            self.history = History(store)
+            self.recorder = Recorder(store, Bus())
+            self.recorder.connect("now-playing", self._tray_tooltip)
+            self.window = Window(self, self.history, self.recorder)
+
+            if HAVE_DBUS:
+                self.tray = Tray(self._build_tray_menu, self.surface_window)
+
+            # First run installs itself. One file, one click, running at login.
+            if not autostart_installed():
+                install_autostart(quiet=True)
+
+            # Without a visible window the app would exit as soon as the last
+            # one closes; the tray needs the process to stay alive.
+            self.hold()
+
+        def do_activate(self):
+            if self.background:
+                self.background = False      # only the very first launch is silent
+                if self.tray is None or not self.tray.registered:
+                    # No tray to hide in, so showing the window is the only sane
+                    # outcome - otherwise the app would be invisible.
+                    self.surface_window()
+                return
+            self.surface_window()
+
+        def surface_window(self):
+            self.window.set_visible(True)
+            self.window.present()
+            return False
+
+        def _tray_tooltip(self, _source, track):
+            if self.tray is None:
+                return
+            if track is None:
+                self.tray.set_tooltip("Last.Pld - logging")
+                return
+            text = ("%s - %s" % (track.title, track.artist) if track.artist
+                    else track.title)
+            self.tray.set_tooltip(text[:59] + "..." if len(text) > 62 else text)
+
+        def _build_tray_menu(self):
+            return [
+                MenuItem("Open history", self.surface_window),
+                MenuItem("Identify song now", self._tray_identify),
+                MenuItem(kind="separator"),
+                MenuItem("Logging", self._tray_toggle_logging,
+                         toggle=not self.recorder.paused),
+                MenuItem("Start at login", self._tray_toggle_autostart,
+                         toggle=autostart_installed()),
+                MenuItem("Open CSV folder", self._tray_open_folder),
+                MenuItem(kind="separator"),
+                MenuItem("Quit Last.Pld", self._tray_quit),
+            ]
+
+        def _tray_identify(self):
+            self.window.identify_now()
+            return False
+
+        def _tray_toggle_logging(self):
+            self.window.toggle_logging()
+            return False
+
+        def _tray_toggle_autostart(self):
+            self.window.toggle_autostart()
+            return False
+
+        def _tray_open_folder(self):
+            self.window._open(os.path.dirname(self.history.path))
+            return False
+
+        def _tray_quit(self):
+            # Quit stops recording too: with logging in-process there is no
+            # daemon left behind, which is what "quit" has to mean.
+            if self.recorder:
+                self.recorder.stop()
+            self.release()
+            self.quit()
+            return False
+
+
+def run_gui(background):
+    if not HAVE_GTK:
+        print("The desktop front end needs PyGObject (GTK4 + libadwaita).\n"
+              "Install it with your package manager, for example:\n"
+              "  sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1\n"
+              "  sudo dnf install python3-gobject gtk4 libadwaita\n\n"
+              "Logging itself needs none of that - run with --quiet to record "
+              "headlessly.", file=sys.stderr)
+        return 1
+    if HAVE_DBUS:
+        DBusGMainLoop(set_as_default=True)
+    return Application(background).run([sys.argv[0]])
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
@@ -1399,8 +2663,16 @@ def main(argv=None):
                         help="authorise pushing identified songs to Spotify")
     parser.add_argument("--disconnect-spotify", action="store_true")
     parser.add_argument("--client-id", metavar="ID", help="Spotify app client ID")
+    parser.add_argument("--background", action="store_true",
+                        help="start in the tray without opening the window")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="record in the terminal even on a desktop")
+    parser.add_argument("--install-autostart", action="store_true",
+                        help="start automatically when you log in")
+    parser.add_argument("--uninstall-autostart", action="store_true",
+                        help="stop starting automatically")
     parser.add_argument("--install-service", action="store_true",
-                        help="write and enable a systemd user service")
+                        help="write and enable a systemd user service (headless boxes)")
     parser.add_argument("--quiet", action="store_true", help="log without printing")
     parser.add_argument("--version", action="version", version="Last.Pld " + VERSION)
     args = parser.parse_args(argv)
@@ -1413,6 +2685,10 @@ def main(argv=None):
         return show_history(args.history)
     if args.search:
         return search_history(args.search)
+    if args.install_autostart:
+        return install_autostart()
+    if args.uninstall_autostart:
+        return uninstall_autostart()
     if args.install_service:
         return install_service()
     if args.disconnect_spotify:
@@ -1422,17 +2698,26 @@ def main(argv=None):
     if args.connect_spotify:
         err = Spotify.connect(args.client_id)
         print(err if err else "Connected. Identified songs will go to your "
-                              "\"Last.Pld\" playlist.")
+                              '"Last.Pld" playlist.')
         return 1 if err else 0
     if args.identify:
         return do_identify()
+
+    # The desktop app is the default when there is a desktop to put it on.
+    # --background comes from the autostart entry, and must still record on a
+    # machine with no GTK - otherwise logging in would silently do nothing.
+    if not (args.quiet or args.no_gui) and gui_possible():
+        return run_gui(args.background)
 
     bus = Bus()
     if not bus.available:
         print("No D-Bus command line tool found (need busctl, gdbus or "
               "dbus-send).\nRun --probe for details.", file=sys.stderr)
         return 1
-    Logger(Store(), Filter.load(), bus, verbose=not args.quiet).run()
+    verbose = not (args.quiet or args.background)
+    if verbose and not autostart_installed():
+        print("Tip: --install-autostart keeps this running after you log in.\n")
+    Logger(Store(), Filter.load(), bus, verbose=verbose).run()
     return 0
 
 
