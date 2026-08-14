@@ -10,6 +10,10 @@ History panel (which is only four entries deep and drops radio tracks entirely).
 
 Single executable, no installer, no runtime to ship. It lives in the tray.
 
+**Linux users:** see [`linux/`](linux/) — a standard-library-only Python port
+built on MPRIS, writing the same CSV format. No pip, no venv, nothing to
+install before the first run.
+
 ## Requirements
 
 | | |
